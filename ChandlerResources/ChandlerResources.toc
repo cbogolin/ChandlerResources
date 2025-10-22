@@ -1,7 +1,0 @@
-## Interface: 100107
-## Title: Chandler Resources
-## Notes: Primary resource bar, circular secondary indicators, DK runes with cooldown overlays, class-tinted background.
-## Author: Chandler
-## Version: 1.5
-## SavedVariables: ChandlerResourcesDB
-ChandlerResources.lua

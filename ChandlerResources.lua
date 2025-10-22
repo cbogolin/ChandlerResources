@@ -1,9 +1,18 @@
--- ChandlerResources.lua v1.5
--- Primary resource bar + centered circular secondary resources.
--- Death Knight runes are shown with cooldown overlays and a distinct frosty style.
--- Frame background uses a muted class color tint. Position and visibility are saved.
+-- ChandlerResources.lua v1.5.1
+-- Updates:
+--  * Smooth primary bar animation on change
+--  * Reliable class-based frame tinting (supports CUSTOM_CLASS_COLORS)
+--  * Primary resource bar has a 1px black border and grey-black background fill
+-- All other features from v1.5 remain: centered orbs, DK runes with cooldown overlays,
+-- saved position/visibility, pulsing animation for non-rune orbs.
 
 local addonName = "ChandlerResources"
+
+------------------------------------------------------------
+-- CONFIG
+------------------------------------------------------------
+local PRIMARY_LERP_SPEED = 8      -- higher = faster interpolation
+local PRIMARY_MIN_STEP = 0.5      -- minimum change step to always move at least this much (to avoid extremely slow changes)
 
 ------------------------------------------------------------
 -- FRAME CREATION
@@ -31,17 +40,40 @@ title:SetPoint("TOP", frame, "TOP", 0, -6)
 title:SetText("Chandler Resources")
 
 ------------------------------------------------------------
--- PRIMARY RESOURCE BAR
+-- PRIMARY RESOURCE BAR (with border + background)
 ------------------------------------------------------------
-local primaryBar = CreateFrame("StatusBar", addonName.."PrimaryBar", frame)
+-- Use BackdropTemplate so we can add a border and background behind the statusbar.
+local primaryBar = CreateFrame("StatusBar", addonName.."PrimaryBar", frame, "BackdropTemplate")
 primaryBar:SetSize(240, 20)
 primaryBar:SetPoint("TOP", title, "BOTTOM", 0, -10)
 primaryBar:SetStatusBarTexture("Interface\\TargetingFrame\\UI-StatusBar")
 primaryBar:GetStatusBarTexture():SetHorizTile(false)
 primaryBar:SetMinMaxValues(0, 1)
 
+-- Create the bar backdrop (this is the grey-black background fill + 1px black border)
+primaryBar:SetBackdrop({
+  bgFile = "Interface\\Buttons\\WHITE8x8",               -- simple solid texture for bg fill
+  edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",   -- border texture
+  tile = true, tileSize = 8, edgeSize = 8,
+})
+-- background fill (grey-black)
+primaryBar:SetBackdropColor(0.06, 0.06, 0.06, 0.95)
+-- black border
+primaryBar:SetBackdropBorderColor(0, 0, 0, 1)
+
+-- Move the statusbar texture slightly inset so border shows
+local tex = primaryBar:GetStatusBarTexture()
+tex:SetPoint("TOPLEFT", primaryBar, "TOPLEFT", 1, -1)
+tex:SetPoint("BOTTOMRIGHT", primaryBar, "BOTTOMRIGHT", -1, 1)
+
+-- floating numeric display below bar
 local primaryText = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 primaryText:SetPoint("TOP", primaryBar, "BOTTOM", 0, -6)
+
+-- smoothing fields
+primaryBar.currentDisplay = 0
+primaryBar.targetValue = 0
+primaryBar.lastMax = 1
 
 ------------------------------------------------------------
 -- SECONDARY ORB CONTAINER (centered)
@@ -52,15 +84,11 @@ local orbSize = 20
 local spacing = 6
 local orbContainer = CreateFrame("Frame", addonName.."OrbContainer", frame)
 orbContainer:SetHeight(orbSize)
--- width will be set dynamically depending on active number
 orbContainer:SetPoint("TOP", primaryText, "BOTTOM", 0, -18)
 
 local secondaryText = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 secondaryText:SetPoint("TOP", orbContainer, "BOTTOM", 0, -6)
 
-------------------------------------------------------------
--- RUNE ORBS (for DK) - we will reuse orbs with special styling when DK
-------------------------------------------------------------
 for i = 1, maxOrbs do
   local orb = CreateFrame("Frame", addonName.."Orb"..i, orbContainer, "BackdropTemplate")
   orb:SetSize(orbSize, orbSize)
@@ -73,10 +101,11 @@ for i = 1, maxOrbs do
   orb:SetBackdropBorderColor(0, 0, 0)
   orb:SetAlpha(0.8)
 
-  -- cooldown overlay frame for runes
+  -- cooldown overlay frame for runes (hidden by default)
   local cd = CreateFrame("Cooldown", nil, orb, "CooldownFrameTemplate")
   cd:SetAllPoints(orb)
   cd:SetCooldown(0, 0)
+  cd:Hide()
   orb.cooldown = cd
 
   -- pulsing animation for non-rune orb fill
@@ -100,9 +129,10 @@ end
 
 -- helper to position container centered with given count
 local function LayoutOrbs(count)
+  if count < 1 then count = 1 end
   local width = count * orbSize + (count - 1) * spacing
   orbContainer:SetWidth(width)
-  -- clear anchors then center
+  -- position orbs left to right, container is centered relative to primaryText
   for i = 1, count do
     local orb = orbs[i]
     orb:ClearAllPoints()
@@ -112,7 +142,6 @@ local function LayoutOrbs(count)
       orb:SetPoint("LEFT", orbs[i-1], "RIGHT", spacing, 0)
     end
   end
-  -- center container relative to frame
   orbContainer:ClearAllPoints()
   orbContainer:SetPoint("TOP", primaryText, "BOTTOM", 0, -18)
 end
@@ -141,12 +170,20 @@ local function GetPowerName(powerType)
   return (powerInfo[powerType] and powerInfo[powerType].name) or "Resource"
 end
 
+-- Robust class tint using CUSTOM_CLASS_COLORS if present, fallback to RAID_CLASS_COLORS
 local function UpdateClassTint()
-  local _, class = UnitClass("player")
-  local color = RAID_CLASS_COLORS and RAID_CLASS_COLORS[class]
-  if color then
+  local _, classToken = UnitClass("player")
+  local colorObj = nil
+  if classToken then
+    if CUSTOM_CLASS_COLORS and CUSTOM_CLASS_COLORS[classToken] then
+      colorObj = CUSTOM_CLASS_COLORS[classToken]
+    elseif RAID_CLASS_COLORS and RAID_CLASS_COLORS[classToken] then
+      colorObj = RAID_CLASS_COLORS[classToken]
+    end
+  end
+  if colorObj then
     -- muted tint: scale color down and apply alpha 0.38
-    local r, g, b = color.r * 0.35, color.g * 0.35, color.b * 0.35
+    local r, g, b = colorObj.r * 0.35, colorObj.g * 0.35, colorObj.b * 0.35
     frame:SetBackdropColor(r, g, b, 0.38)
   else
     frame:SetBackdropColor(0, 0, 0, 0.6)
@@ -154,17 +191,46 @@ local function UpdateClassTint()
 end
 
 ------------------------------------------------------------
--- UPDATE DISPLAY
+-- PRIMARY BAR SMOOTHING ONUPDATE
+------------------------------------------------------------
+-- We'll run a small OnUpdate to smoothly lerp the displayed value towards the target
+local lastUpdate = 0
+frame:SetScript("OnUpdate", function(self, elapsed)
+  lastUpdate = lastUpdate + elapsed
+  -- Smooth primary bar interpolation
+  local display = primaryBar.currentDisplay or 0
+  local target = primaryBar.targetValue or 0
+  local max = primaryBar.lastMax or 1
+
+  if display ~= target then
+    -- compute step based on elapsed and speed
+    local diff = target - display
+    local step = diff * math.min(1, elapsed * PRIMARY_LERP_SPEED)
+    -- if step is tiny, push it to a minimum so animation does not stall
+    if math.abs(step) < 0.01 then
+      step = (step > 0 and 0.01) or (step < 0 and -0.01)
+    end
+    local newDisplay = display + step
+
+    -- clamp between 0 and max
+    if newDisplay < 0 then newDisplay = 0 end
+    if newDisplay > max then newDisplay = max end
+
+    primaryBar.currentDisplay = newDisplay
+    primaryBar:SetValue(newDisplay)
+  end
+end)
+
+------------------------------------------------------------
+-- RUNE HANDLING + GENERIC SECONDARY
 ------------------------------------------------------------
 local function UpdateRunes()
-  -- Only relevant if player is DK class. We still will call for all classes but skip if not DK.
   local _, class = UnitClass("player")
   if class ~= "DEATHKNIGHT" then
     return nil
   end
 
   local total = 6
-  -- layout 6 runes
   LayoutOrbs(total)
   secondaryText:SetText("Runes")
 
@@ -173,20 +239,19 @@ local function UpdateRunes()
     local orb = orbs[i]
     orb:Show()
 
-    -- distinct rune styling
-    orb:SetBackdropColor(0.22, 0.28, 0.38, 1) -- frosty blue-gray background for rune
+    -- distinct rune styling (frosty look)
+    orb:SetBackdropColor(0.22, 0.28, 0.38, 1) -- base rune bg
     orb:SetBackdropBorderColor(0.06, 0.12, 0.18)
 
     if start and duration and duration > 0 and not ready then
       orb.cooldown:SetCooldown(start, duration)
       orb.cooldown:Show()
-      -- visually indicate recharging: desaturated/darker
       orb:SetAlpha(0.8)
       orb.active = false
+      orb.pulseAnim:Stop()
     else
       orb.cooldown:Clear()
       orb.cooldown:Hide()
-      -- ready rune shows bright fill
       orb:SetBackdropColor(0.65, 0.85, 1, 1)
       if not orb.active then
         orb.pulseAnim:Play()
@@ -198,7 +263,6 @@ local function UpdateRunes()
 end
 
 local function UpdateSecondaryGeneric(id, name)
-  -- show a generic secondary resource like combo points, chi, holy power, etc.
   local cur = UnitPower("player", id)
   local maxVal = UnitPowerMax("player", id)
   if not cur or maxVal == 0 then
@@ -210,7 +274,6 @@ local function UpdateSecondaryGeneric(id, name)
   for i = 1, maxVal do
     local orb = orbs[i]
     orb:Show()
-    -- standard orb fill color
     orb:SetBackdropColor(0.18, 0.18, 0.18, 0.45)
     orb:SetBackdropBorderColor(0, 0, 0)
 
@@ -224,50 +287,60 @@ local function UpdateSecondaryGeneric(id, name)
       orb:SetBackdropColor(0.18, 0.18, 0.18, 0.45)
       orb.active = false
     end
-    -- ensure cooldown overlay is hidden for non-runes
     if orb.cooldown then
       orb.cooldown:Clear()
       orb.cooldown:Hide()
     end
   end
 
-  -- hide any leftover orbs
   for i = maxVal + 1, #orbs do
     orbs[i]:Hide()
     orbs[i].active = false
+    if orbs[i].cooldown then
+      orbs[i].cooldown:Clear()
+      orbs[i].cooldown:Hide()
+    end
   end
 
   return true
 end
 
+------------------------------------------------------------
+-- MAIN UPDATE
+------------------------------------------------------------
 local function UpdateDisplay()
   -- class tint update
   UpdateClassTint()
 
   -- primary resource
   local powerType = UnitPowerType("player")
-  local current = UnitPower("player", powerType)
-  local max = UnitPowerMax("player", powerType)
+  local current = UnitPower("player", powerType) or 0
+  local max = UnitPowerMax("player", powerType) or 1
   local r, g, b = GetPowerColor(powerType)
-  primaryBar:SetMinMaxValues(0, max)
-  primaryBar:SetValue(current)
+  primaryBar.lastMax = max
+
+  -- set target value and let OnUpdate lerp the visual
+  primaryBar.targetValue = current
+  -- ensure currentDisplay is initialized
+  if not primaryBar.currentDisplay then
+    primaryBar.currentDisplay = current
+    primaryBar:SetValue(current)
+  end
+
+  -- keep statusbar color and text in sync
   primaryBar:SetStatusBarColor(r, g, b)
   primaryText:SetText(string.format("%s: %d / %d", GetPowerName(powerType), current, max))
 
-  -- secondary resources: check DK runes first if DK, otherwise check other secondaries
+  -- secondary handling
   local _, class = UnitClass("player")
   local handled = false
 
   if class == "DEATHKNIGHT" then
-    -- show runes plus Runic Power bar will still be shown as primary if it's the player's power
     UpdateRunes()
     handled = true
-    -- additional secondary resources for DKs (like rune-like combo) usually not needed
-    -- but still attempt to show other secondaries if available
   end
 
   if not handled then
-    -- try generic secondary types in order
     local secondaryTypes = {
       {Enum.PowerType.ComboPoints, "Combo Points"},
       {Enum.PowerType.HolyPower, "Holy Power"},
@@ -286,7 +359,6 @@ local function UpdateDisplay()
     end
 
     if not found then
-      -- hide orbs and clear text
       secondaryText:SetText("")
       for i = 1, #orbs do
         orbs[i]:Hide()
@@ -297,9 +369,6 @@ local function UpdateDisplay()
         end
       end
     end
-  else
-    -- If handled by DK runes, also attempt to show other secondaries if present (e.g. DK could have Runic Power shown as primary)
-    -- No additional orbs are added for those here since runes are shown in the orb slots.
   end
 end
 
@@ -338,16 +407,15 @@ frame:SetScript("OnEvent", function(self, event, arg1, ...)
     return
   end
 
-  -- Only update when the player is the unit changed where applicable
-  if event:match("^UNIT_") then
-    if arg1 ~= "player" then return end
+  if event:match("^UNIT_") and arg1 and arg1 ~= "player" then
+    return
   end
 
-  -- For runes, always update
+  -- For runes and cooldown visuals we update always
   UpdateDisplay()
 end)
 
--- ensure periodic updates for cooldown visuals
+-- periodic ticker to keep cooldown visuals up to date
 local ticker = C_Timer.NewTicker(0.25, UpdateDisplay)
 
 ------------------------------------------------------------

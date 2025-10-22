@@ -216,15 +216,19 @@ local function UpdatePrimaryBar()
 end
 
 frame:SetScript("OnUpdate", function(self, elapsed)
+    -- Fetch current power
     local powerType = UnitPowerType("player")
     local cur = UnitPower("player", powerType) or 0
     local max = UnitPowerMax("player", powerType) or 1
+
+    -- Ensure min/max are set
+    primaryBar:SetMinMaxValues(0, max)
     primaryBar.lastMax = max
     primaryBar.targetValue = cur
 
-    local display = tonumber(primaryBar.currentDisplay) or 0
-    local target = tonumber(primaryBar.targetValue) or 0
-    max = tonumber(primaryBar.lastMax) or 1
+    -- Smooth interpolation
+    local display = tonumber(primaryBar.currentDisplay) or cur
+    local target = tonumber(primaryBar.targetValue) or cur
 
     if display ~= target then
         local diff = target - display
@@ -232,13 +236,18 @@ frame:SetScript("OnUpdate", function(self, elapsed)
         if step == 0 or type(step) ~= "number" then
             step = 0.01 * (diff > 0 and 1 or -1)
         end
-        local newDisplay = math.max(0, math.min(display + step, max))
+        local newDisplay = display + step
+
+        -- Clamp to [0, max]
+        if newDisplay < 0 then newDisplay = 0 end
+        if newDisplay > max then newDisplay = max end
+
         primaryBar.currentDisplay = newDisplay
-        primaryBar:SetValue(newDisplay)
+        primaryBar:SetValue(newDisplay)  -- THIS line ensures the bar fills/depletes
     end
 
-    -- update the primary text
-    primaryText:SetText(string.format("%s: %d / %d", GetPowerName(powerType), math.floor(display), max))
+    -- Update text
+    primaryText:SetText(string.format("%s: %d / %d", GetPowerName(powerType), math.floor(primaryBar.currentDisplay), max))
 end)
 
 ------------------------------------------------------------
